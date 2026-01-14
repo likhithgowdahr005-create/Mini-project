@@ -1,0 +1,349 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Hologram Calibrator (Axis-Locked 4-Plane + Background Isolation)</title>
+  <style>
+    :root {
+      --tile: 38vmin;
+      --gap: 4vmin;
+      --dx: 0vmin;
+      --dy: 0vmin;
+      --cross: 2px;
+      --offset: calc((var(--tile) + var(--gap)) / 2);
+    }
+
+    html,
+    body {
+      margin: 0;
+      height: 100%;
+      background: #000;
+      color: #ddd;
+      font-family: system-ui, Segoe UI, Roboto, Arial, sans-serif;
+      overflow: hidden;
+    }
+
+    /* Controls */
+    #ui {
+      position: fixed;
+      left: 1rem;
+      top: 1rem;
+      z-index: 10;
+      display: flex;
+      gap: .5rem;
+      flex-wrap: wrap;
+      background: rgba(0, 0, 0, .45);
+      border: 1px solid #333;
+      border-radius: .5rem;
+      padding: .6rem .7rem;
+      backdrop-filter: blur(4px);
+    }
+
+    #ui * {
+      font-size: .95rem
+    }
+
+    button,
+    input[type=range],
+    select {
+      background: #111;
+      color: #eee;
+      border: 1px solid #333;
+      border-radius: .4rem;
+      padding: .35rem .6rem;
+    }
+
+    label {
+      display: flex;
+      align-items: center;
+      gap: .4rem
+    }
+
+    /* Stage */
+    #stage {
+      position: relative;
+      width: 100vw;
+      height: 100vh;
+    }
+
+    .tile {
+      position: absolute;
+      width: var(--tile);
+      height: var(--tile);
+      left: 50%;
+      top: 50%;
+      display: grid;
+      place-items: center;
+    }
+
+    video {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      background: #000;
+      transform: scaleX(var(--mx, 1));
+    }
+
+    /* Axis-locked placement */
+    #t {
+      transform: translate(-50%, -50%) translate(var(--dx), calc(var(--dy) - var(--offset)));
+    }
+
+    #b {
+      transform: translate(-50%, -50%) translate(var(--dx), calc(var(--dy) + var(--offset))) rotate(180deg);
+    }
+
+    #l {
+      transform: translate(-50%, -50%) translate(calc(var(--dx) - var(--offset)), var(--dy)) rotate(-90deg);
+    }
+
+    #r {
+      transform: translate(-50%, -50%) translate(calc(var(--dx) + var(--offset)), var(--dy)) rotate(90deg);
+    }
+
+    /* Crosshair + bullseye */
+    #crossX,
+    #crossY {
+      position: absolute;
+      left: 50%;
+      top: 50%;
+      background: #2a2a2a;
+      opacity: .75;
+      z-index: 1;
+    }
+
+    #crossX {
+      width: 100vw;
+      height: var(--cross);
+      transform: translate(-50%, -50%)
+    }
+
+    #crossY {
+      width: var(--cross);
+      height: 100vh;
+      transform: translate(-50%, -50%)
+    }
+
+    #bull {
+      position: absolute;
+      left: 50%;
+      top: 50%;
+      width: 8vmin;
+      height: 8vmin;
+      border: 1px dashed #444;
+      border-radius: 50%;
+      transform: translate(-50%, -50%);
+      opacity: .6;
+    }
+
+    /* Hidden raw video element (source) */
+    #raw {
+      position: fixed;
+      left: -9999px;
+      top: -9999px
+    }
+  </style>
+</head>
+
+<body>
+  <div id="ui">
+    <label>Camera <select id="cam"></select></label>
+    <label>Tile <input id="tile" type="range" min="24" max="60" value="38" /></label>
+    <label>Gap <input id="gap" type="range" min="0" max="12" value="4" /></label>
+    <label>X <input id="dx" type="range" min="-6" max="6" value="0" /></label>
+    <label>Y <input id="dy" type="range" min="-6" max="6" value="0" /></label>
+    <label>Background
+      <select id="bg">
+        <option value="isolate" selected>On (isolate person)</option>
+        <option value="normal">Off (raw camera)</option>
+      </select>
+    </label>
+    <button id="rot">Rotate 90°</button>
+    <button id="mir">Mirror</button>
+    <button id="fs">Full-screen</button>
+    <button id="hide">Hide UI</button>
+  </div>
+
+  <div id="stage">
+    <div id="crossX"></div>
+    <div id="crossY"></div>
+    <div id="bull"></div>
+    <div class="tile" id="t"><video id="v1" autoplay playsinline muted></video></div>
+    <div class="tile" id="b"><video id="v2" autoplay playsinline muted></video></div>
+    <div class="tile" id="l"><video id="v3" autoplay playsinline muted></video></div>
+    <div class="tile" id="r"><video id="v4" autoplay playsinline muted></video></div>
+  </div>
+
+  <!-- raw camera element (not displayed) -->
+  <video id="raw" autoplay playsinline muted></video>
+
+  <script type="module">
+    /* ===== UI & elements ===== */
+    const vids = ['v1', 'v2', 'v3', 'v4'].map(id => document.getElementById(id));
+    const raw = document.getElementById('raw');
+    const camSel = document.getElementById('cam');
+    const rngTile = document.getElementById('tile');
+    const rngGap = document.getElementById('gap');
+    const rngDx = document.getElementById('dx');
+    const rngDy = document.getElementById('dy');
+    const btnRot = document.getElementById('rot');
+    const btnMir = document.getElementById('mir');
+    const btnFs = document.getElementById('fs');
+    const btnHide = document.getElementById('hide');
+    const bgSel = document.getElementById('bg');
+
+    let stream = null, rotated = false, mirrored = false;
+    let isolatorReady = false, usingIsolation = true;
+
+    /* ===== CSS helpers ===== */
+    const setv = (name, v) => document.documentElement.style.setProperty(name, v + 'vmin');
+    function applyUI() {
+      setv('--tile', +rngTile.value);
+      setv('--gap', +rngGap.value);
+      setv('--dx', +rngDx.value);
+      setv('--dy', +rngDy.value);
+    }
+
+    /* ===== Camera handling ===== */
+    async function start(deviceId) {
+      if (stream) { stream.getTracks().forEach(t => t.stop()); }
+      const constraints = deviceId
+        ? { video: { deviceId: { exact: deviceId }, width: { ideal: 640 }, height: { ideal: 480 } } }
+        : { video: { facingMode: 'environment', width: { ideal: 640 }, height: { ideal: 480 } } };
+
+      stream = await navigator.mediaDevices.getUserMedia(constraints);
+      raw.srcObject = stream;
+      await raw.play().catch(() => { });
+
+      if (usingIsolation && isolatorReady) {
+        startIsolationLoop();
+      } else {
+        vids.forEach(v => v.srcObject = stream);
+      }
+    }
+
+    async function listCams() {
+      const devs = await navigator.mediaDevices.enumerateDevices();
+      const cams = devs.filter(d => d.kind === 'videoinput');
+      camSel.innerHTML = '';
+      cams.forEach((c, i) => {
+        const o = document.createElement('option');
+        o.value = c.deviceId;
+        o.textContent = c.label || `Camera ${i + 1}`;
+        camSel.appendChild(o);
+      });
+    }
+
+    /* ===== Rotation / Mirror ===== */
+    function rotateLayout(on) {
+      const t = document.getElementById('t').style;
+      const b = document.getElementById('b').style;
+      const l = document.getElementById('l').style;
+      const r = document.getElementById('r').style;
+      if (on) {
+        t.transform = "translate(-50%,-50%) translate(calc(var(--dx) - var(--offset)), var(--dy)) rotate(-90deg)";
+        b.transform = "translate(-50%,-50%) translate(calc(var(--dx) + var(--offset)), var(--dy)) rotate(90deg)";
+        l.transform = "translate(-50%,-50%) translate(var(--dx), calc(var(--dy) + var(--offset))) rotate(180deg)";
+        r.transform = "translate(-50%,-50%) translate(var(--dx), calc(var(--dy) - var(--offset)))";
+      } else {
+        t.transform = "translate(-50%,-50%) translate(var(--dx), calc(var(--dy) - var(--offset)))";
+        b.transform = "translate(-50%,-50%) translate(var(--dx), calc(var(--dy) + var(--offset))) rotate(180deg)";
+        l.transform = "translate(-50%,-50%) translate(calc(var(--dx) - var(--offset)), var(--dy)) rotate(-90deg)";
+        r.transform = "translate(-50%,-50%) translate(calc(var(--dx) + var(--offset)), var(--dy)) rotate(90deg)";
+      }
+    }
+
+    /* ===== Background Isolation (MediaPipe) ===== */
+    let segCanvas, segCtx, selfieSegmentation;
+
+    async function setupIsolation() {
+      try {
+        const mpSeg = await import('https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation/selfie_segmentation.js');
+        const SelfieSegmentation = (mpSeg.SelfieSegmentation) || (window.SelfieSegmentation);
+        selfieSegmentation = new SelfieSegmentation({
+          locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation/${file}`
+        });
+        selfieSegmentation.setOptions({ modelSelection: 1 });
+
+        segCanvas = document.createElement('canvas');
+        segCtx = segCanvas.getContext('2d');
+
+        selfieSegmentation.onResults((results) => {
+          const w = segCanvas.width, h = segCanvas.height;
+          segCtx.clearRect(0, 0, w, h);
+          segCtx.drawImage(results.segmentationMask, 0, 0, w, h);
+          segCtx.globalCompositeOperation = 'source-in';
+          segCtx.drawImage(results.image, 0, 0, w, h);
+          segCtx.globalCompositeOperation = 'destination-over';
+          segCtx.fillStyle = 'black';
+          segCtx.fillRect(0, 0, w, h);
+          segCtx.globalCompositeOperation = 'source-over';
+        });
+
+        isolatorReady = true;
+      } catch (e) {
+        console.warn('Isolation not available; falling back to normal camera.', e);
+        isolatorReady = false;
+      }
+    }
+
+    let rafId = null;
+    async function startIsolationLoop() {
+      if (!isolatorReady) { vids.forEach(v => v.srcObject = stream); return; }
+
+      const w = raw.videoWidth || 640;
+      const h = raw.videoHeight || 480;
+      segCanvas.width = w; segCanvas.height = h;
+
+      const isoStream = segCanvas.captureStream(30);
+      vids.forEach(v => v.srcObject = isoStream);
+
+      const step = async () => {
+        try { await selfieSegmentation.send({ image: raw }); } catch (_) { }
+        rafId = requestAnimationFrame(step);
+      };
+      if (rafId) cancelAnimationFrame(rafId);
+      step();
+    }
+
+    /* ===== Orientation Detection ===== */
+    function detectOrientation() {
+      const isLandscape = window.matchMedia
+        ? window.matchMedia("(orientation: landscape)").matches
+        : (window.innerWidth > window.innerHeight);
+      // Only auto-rotate if user hasn’t manually toggled
+      if (!manualRotationOverride) {
+        rotated = isLandscape;
+        rotateLayout(rotated);
+      }
+    }
+
+    let manualRotationOverride = false;
+    window.addEventListener('resize', detectOrientation);
+    window.matchMedia("(orientation: landscape)").addEventListener('change', detectOrientation);
+
+    /* ===== Events ===== */
+    camSel.onchange = e => start(e.target.value);
+    [rngTile, rngGap, rngDx, rngDy].forEach(el => el.oninput = applyUI);
+    btnRot.onclick = () => {
+      rotated = !rotated;
+      manualRotationOverride = true;
+      rotateLayout(rotated);
+    };
+    btnMir.onclick = () => { mirrored = !mirrored; document.documentElement.style.setProperty('--mx', mirrored ? '-1' : '1'); };
+    btnFs.onclick = () => { const el = document.documentElement; document.fullscreenElement ? document.exitFullscreen() : el.requestFullscreen?.(); };
+    btnHide.onclick = () => document.getElementById('ui').style.display = 'none';
+    bgSel.onchange = () => { usingIsolation = (bgSel.value === 'isolate'); start(camSel.value || undefined); };
+
+    /* ===== Boot ===== */
+    applyUI();
+    await setupIsolation();
+    await start();
+    await listCams();
+    detectOrientation();
+  </script>
+</body>
+
+</html>
